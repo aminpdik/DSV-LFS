@@ -230,7 +230,7 @@ class DSVLFSForCausalLM(LlavaLlamaForCausalLM):
         else:
             config.mm_vision_tower = config.vision_tower
 
-        self.seg_token_idx = kwargs.pop("seg_token_idx")
+        self.sem_token_idx = kwargs.pop("sem_token_idx")
 
         super().__init__(config)
 
@@ -367,7 +367,7 @@ class DSVLFSForCausalLM(LlavaLlamaForCausalLM):
             output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
             output_hidden_states_list.append(output_hidden_states_level)
             output_hidden_states = output_hidden_states_list
-            SeGtokenVec = SeGtokenVec == self.seg_token_idx
+            SeGtokenVec = SeGtokenVec == self.sem_token_idx
             output = None
 
         else:
@@ -390,7 +390,7 @@ class DSVLFSForCausalLM(LlavaLlamaForCausalLM):
                 labels=labels,
                 output_hidden_states=True,
             )
-            SeGtokenVec = SeGtokenVec == self.seg_token_idx
+            SeGtokenVec = SeGtokenVec == self.sem_token_idx
             # SeGtokenVec = SeGtokenVec == self.seg_token_idx
             output_hidden_states = output.hidden_states
 

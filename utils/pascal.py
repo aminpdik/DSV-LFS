@@ -136,7 +136,7 @@ class DatasetPASCAL(torch.utils.data.Dataset):
         class_ids = []
         for sampled_cls in sampled_classes:
             text = sampled_cls
-
+            # print(text)
             if text[-1]=='\n':
                 text=text[:-1]
 

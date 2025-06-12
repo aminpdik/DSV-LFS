@@ -3,6 +3,7 @@ from enum import Enum
 import numpy as np
 import torch
 import torch.distributed as dist
+import os
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
@@ -11,34 +12,12 @@ DEFAULT_IMAGE_PATCH_TOKEN = "<im_patch>"
 DEFAULT_IM_START_TOKEN = "<im_start>"
 DEFAULT_IM_END_TOKEN = "<im_end>"
 
-SHORT_QUESTION_LIST = [
-    DEFAULT_IMAGE_TOKEN + "\n" + "Can you segment the {class_name} in this image?",
-    DEFAULT_IMAGE_TOKEN + "\n" + "Please segment the {class_name} in this image.",
-    DEFAULT_IMAGE_TOKEN
-    + "\n"
-    + "What is {class_name} in this image? Please respond with segmentation mask.",
-    DEFAULT_IMAGE_TOKEN
-    + "\n"
-    + "What is {class_name} in this image? Please output segmentation mask.",
-]
-
-LONG_QUESTION_LIST = [
-    DEFAULT_IMAGE_TOKEN + "\n" + "{sent} Please respond with segmentation mask.",
-    DEFAULT_IMAGE_TOKEN + "\n" + "{sent} Please output segmentation mask.",
-]
-
-EXPLANATORY_QUESTION_LIST = [
-    "Please output segmentation mask and explain why.",
-    "Please output segmentation mask and explain the reason.",
-    "Please output segmentation mask and give some explanation.",
-]
-
 ANSWER_LIST = [
-    "It is [SEG].",
-    "Sure, [SEG].",
-    "Sure, it is [SEG].",
-    "Sure, the segmentation result is [SEG].",
-    "[SEG].",
+    "It is [SEM].",
+    "Sure, [SEM].",
+    "Sure, it is [SEM].",
+    "Sure, the segmentation result is [SEM].",
+    "[SEM].",
 ]
 
 SHORT_QUESTION_LIST3 = [
@@ -143,6 +122,54 @@ COCOclasses={0: u'background',
  78: u'teddy bear',
  79: u'hair drier',
  80: u'toothbrush'}
+
+
+
+def build_img_metadata(split,nfolds,fold):
+
+    def read_metadata(split, fold_id):
+        fold_n_metadata = os.path.join('./splits/pascal/%s/fold%d.txt' % (split, fold_id))
+        with open(fold_n_metadata, 'r') as f:
+            fold_n_metadata = f.read().split('\n')[:-1]
+        fold_n_metadata = [[data.split('__')[0], int(data.split('__')[1]) - 1] for data in fold_n_metadata]
+        return fold_n_metadata
+
+    img_metadata = []
+    if split == 'trn':  # For training, read image-metadata of "the other" folds
+        for fold_id in range(nfolds):
+            if fold_id == fold:  # Skip validation fold
+                continue
+            img_metadata += read_metadata(split, fold_id)
+    elif split == 'val':  # For validation, read image-metadata of "current" fold
+        img_metadata = read_metadata(split, fold)
+    else:
+        raise Exception('Undefined split %s: ' % split)
+
+
+    return img_metadata
+
+def PrepResume(args,model_engine):
+    # resume deepspeed checkpoint
+    if args.auto_resume and len(args.resume) == 0:
+        resume = os.path.join(args.log_dir, "ckpt_model")
+        if os.path.exists(resume):
+            args.resume = resume
+
+    if args.resume:
+        load_path, client_state = model_engine.load_checkpoint(args.resume)
+        with open(os.path.join(args.resume, "latest"), "r") as f:
+            ckpt_dir = f.readlines()[0].strip()
+        args.start_epoch = (
+                int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
+        )
+        print(
+            "resume training from {}, start from epoch {}".format(
+                args.resume, args.start_epoch
+            )
+        )
+
+    return args,model_engine
+
 
 
 class Summary(Enum):

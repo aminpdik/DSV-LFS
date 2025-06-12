@@ -4,7 +4,7 @@ import shutil
 import sys
 import time
 from functools import partial
-from utils.config import parse_args
+from utils.config import parse_args,GenDSConfig
 import deepspeed
 import numpy as np
 import torch
@@ -12,46 +12,17 @@ import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
-
 from model.DSVLFS import DSVLFSForCausalLM
 from model.llava import conversation as conversation_lib
-
 from utils.dataset import collate_fn
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
-import cv2
+                         AverageMeter, ProgressMeter, dict_to_cuda,
+                         build_img_metadata,PrepResume)
 import random
 from utils.dataset import FSSDataset
 from utils.logger import  AverageMeter1
 from utils.evaluation import Evaluator
 
-
-
-
-
-def build_img_metadata(split,nfolds,fold):
-
-    def read_metadata(split, fold_id):
-        fold_n_metadata = os.path.join('./splits/pascal/%s/fold%d.txt' % (split, fold_id))
-        with open(fold_n_metadata, 'r') as f:
-            fold_n_metadata = f.read().split('\n')[:-1]
-        fold_n_metadata = [[data.split('__')[0], int(data.split('__')[1]) - 1] for data in fold_n_metadata]
-        return fold_n_metadata
-
-    img_metadata = []
-    if split == 'trn':  # For training, read image-metadata of "the other" folds
-        for fold_id in range(nfolds):
-            if fold_id == fold:  # Skip validation fold
-                continue
-            img_metadata += read_metadata(split, fold_id)
-    elif split == 'val':  # For validation, read image-metadata of "current" fold
-        img_metadata = read_metadata(split, fold)
-    else:
-        raise Exception('Undefined split %s: ' % split)
-
-
-    return img_metadata
 
 def CreateModelTokenizer(args):
 
@@ -64,8 +35,8 @@ def CreateModelTokenizer(args):
         use_fast=False,
     )
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_tokens = tokenizer.add_tokens("[SEG]", special_tokens=True)
-    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    num_added_tokens = tokenizer.add_tokens("[SEM]", special_tokens=True)
+    args.sem_token_idx = tokenizer("[SEM]", add_special_tokens=False).input_ids[0]
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
@@ -78,7 +49,7 @@ def CreateModelTokenizer(args):
         "ce_loss_weight": args.ce_loss_weight,
         "dice_loss_weight": args.dice_loss_weight,
         "bce_loss_weight": args.bce_loss_weight,
-        "seg_token_idx": args.seg_token_idx,
+        "sem_token_idx": args.sem_token_idx,
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
@@ -173,6 +144,7 @@ def CreateModelTokenizer(args):
 
     return model,tokenizer
 
+
 def main(args):
 
 
@@ -185,8 +157,9 @@ def main(args):
     else:
         writer = None
 
-
+    ## Define model and tokenizer
     model,tokenizer=CreateModelTokenizer(args)
+
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1
@@ -198,7 +171,7 @@ def main(args):
 
     #print(args.steps_per_epoch)
     samples_per_epoch = args.batch_size*args.grad_accumulation_steps*args.steps_per_epoch*world_size
-    print('-----',samples_per_epoch)
+    # print('-----',samples_per_epoch)
 
     FSSDataset.initialize(datapath=args.dataset_dir)
     train_dataset = FSSDataset.build_dataset(args.benchmark,samples_per_epoch,args.image_size,args.vision_tower, args.fold, 'trn')
@@ -215,43 +188,6 @@ def main(args):
         print(f"Training with {len(train_dataset)} examples.")
 
 
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": 0.0,
-                "betas": (args.beta1, args.beta2),
-            },
-        },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": args.epochs * args.steps_per_epoch,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.lr,
-                "warmup_num_steps": 100,
-                "warmup_type": "linear",
-            },
-        },
-        "fp16": {
-            "enabled": args.precision == "fp16",
-        },
-        "bf16": {
-            "enabled": args.precision == "bf16",
-        },
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-        },
-    }
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
@@ -263,27 +199,10 @@ def main(args):
             use_mm_start_end=args.use_mm_start_end,
             local_rank=args.local_rank,
         ),
-        config=ds_config,
+        config=GenDSConfig(args),
     )
 
-    # resume deepspeed checkpoint
-    if args.auto_resume and len(args.resume) == 0:
-        resume = os.path.join(args.log_dir, "ckpt_model")
-        if os.path.exists(resume):
-            args.resume = resume
-
-    if args.resume:
-        load_path, client_state = model_engine.load_checkpoint(args.resume)
-        with open(os.path.join(args.resume, "latest"), "r") as f:
-            ckpt_dir = f.readlines()[0].strip()
-        args.start_epoch = (
-            int(ckpt_dir.replace("global_step", "")) // args.steps_per_epoch
-        )
-        print(
-            "resume training from {}, start from epoch {}".format(
-                args.resume, args.start_epoch
-            )
-        )
+    args, model_engine=PrepResume(args, model_engine)
 
     # validation dataset
     if val_dataset is not None:
@@ -319,8 +238,7 @@ def main(args):
     print('fold= ', args.fold)
     
     for epoch in range(args.start_epoch, args.epochs):
-
-        #miou, fbiou = validate(val_loader, model_engine, epoch, writer, args)
+        # miou, fbiou = validate(val_loader, model_engine, epoch, writer, args)
         # train for one epoch
         train_iter = train(
             train_loader,
@@ -356,43 +274,6 @@ def main(args):
             model_engine.save_checkpoint(save_dir)
 
 
-    print('miou Kfolds -------------------')    
-    MIOU=0
-    FBIOU=0
-    cnti=0
-    for ii in range(8):
-        cnti+=1
-
-        test_dataset = FSSDataset.build_dataset(args.benchmark, samples_per_epoch, args.image_size, args.vision_tower,
-                                               args.fold, 'test')
-        assert args.val_batch_size == 1
-
-        test_sampler = torch.utils.data.distributed.DistributedSampler(
-            test_dataset, shuffle=False, drop_last=False
-        )
-        val_loader = torch.utils.data.DataLoader(
-            test_dataset,
-            batch_size=args.val_batch_size,
-            shuffle=False,
-            num_workers=0,
-            pin_memory=False,
-            sampler=test_sampler,
-            collate_fn=partial(
-                collate_fn,
-                tokenizer=tokenizer,
-                conv_type=args.conv_type,
-                use_mm_start_end=args.use_mm_start_end,
-                local_rank=args.local_rank,
-            ),
-        )
-
-        print('Experiment ', str(ii))
-        miou, fbiou = validateKFold(val_loader, model_engine, 0, writer, args)
-        MIOU+=miou
-        FBIOU+=fbiou
-
-    print('AVGmiou= ',MIOU/cnti)
-    print('AVGfbiou= ',FBIOU/cnti)
 
 
 
@@ -408,6 +289,7 @@ def fix_randseed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+
 
 def train(
         train_loader,
@@ -542,6 +424,7 @@ def train(
 
     return train_iter
 
+
 def validate(val_loader, model_engine, epoch, writer, args):
 
     fix_randseed(0)
@@ -572,90 +455,6 @@ def validate(val_loader, model_engine, epoch, writer, args):
             pred_masks = output_dict["pred_masks"]
             masks_list = output_dict["gt_masks"].int()
             output_list = (pred_masks[0] > 0).int()
-        '''
-        mask = (255 * masks_list.cpu().numpy()).astype(np.uint8)[0]
-        Out = (255 * output_list.cpu().numpy()).astype(np.uint8)[0]
-        Tmp = (120 * np.ones((400, 10))).astype(np.uint8)
-        Final = np.concatenate((Out, Tmp, mask), 1)
-
-        # print(masks_list.size(),output_list.size())
-        classNUmber = str(int(input_dict["class_sample_list"][0]))
-        Qname = input_dict['query_name_list']
-        Sname = input_dict['support_names_list'][0]
-
-        cv2.imwrite('PredIm/' + Qname + '---' + Sname + '---' + classNUmber + '---' + str(idx) + '.png', Final)
-
-        # classNUmber=str(int(input_dict["class_sample_list"][0]))
-        # Qname=input_dict['query_name_list'].split('/')[1].replace('.jpg','')
-        # Sname=input_dict['support_names_list'][0].split('/')[1].replace('.jpg','')
-
-        torch.save(output_list,
-                   'PredIm/'+args.exp_name+'/' + Qname + '---' + Sname + '---' + classNUmber + '---' + str(idx) + '---Pred.pt')
-        torch.save(masks_list,
-                   'PredIm/'+args.exp_name+'/' + Qname + '---' + Sname + '---' + classNUmber + '---' + str(idx) + '---Mask.pt')
-        '''
-        area_inter, area_union = Evaluator.classify_prediction(output_list, masks_list, None)
-        average_meter1.update(area_inter, area_union, input_dict["class_sample_list"], None)
-        average_meter1.write_process(idx, len(val_loader), epoch, write_batch_idx=50)
-
-    miouFewshot, fb_iouFewshot = average_meter1.compute_iou()
-
-    if args.local_rank == 0:
-        print("miou: {:.4f}, fbiou: {:.4f}".format(miouFewshot, fb_iouFewshot))
-
-    return miouFewshot, fb_iouFewshot
-
-def validateKFold(val_loader, model_engine, epoch, writer, args):
-
-    fix_randseed(None)
-    average_meter1 = AverageMeter1(val_loader.dataset)
-
-    model_engine.eval()
-
-    idx = -1
-    for input_dict in tqdm.tqdm(val_loader):
-        idx += 1
-        torch.cuda.empty_cache()
-
-        input_dict = dict_to_cuda(input_dict)
-        if args.precision == "fp16":
-            input_dict["images"] = input_dict["images"].half()
-            input_dict["images_clip"] = input_dict["images_clip"].half()
-        elif args.precision == "bf16":
-            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-            input_dict["Simage_clip"] = input_dict["Simage_clip"].bfloat16()
-            input_dict["images"] = input_dict["images"].bfloat16()
-            input_dict["Simages"] = input_dict["Simages"].bfloat16()
-        else:
-            input_dict["images"] = input_dict["images"].float()
-            input_dict["images_clip"] = input_dict["images_clip"].float()
-
-        with torch.no_grad():
-            output_dict = model_engine(**input_dict)
-            pred_masks = output_dict["pred_masks"]
-            masks_list = output_dict["gt_masks"].int()
-            output_list = (pred_masks[0] > 0).int()
-
-        # mask = (255 * masks_list.cpu().numpy()).astype(np.uint8)[0]
-        # Out = (255 * output_list.cpu().numpy()).astype(np.uint8)[0]
-        # Tmp = (120 * np.ones((400, 10))).astype(np.uint8)
-        # Final = np.concatenate((Out, Tmp, mask), 1)
-        #
-        # # print(masks_list.size(),output_list.size())
-        # classNUmber = str(int(input_dict["class_sample_list"][0]))
-        # Qname = input_dict['query_name_list'].split('/')[1].replace('.jpg', '')
-        # Sname = input_dict['support_names_list'][0].split('/')[1].replace('.jpg', '')
-        #
-        # cv2.imwrite('PredIm/' + Qname + '---' + Sname + '---' + classNUmber + '---' + str(idx) + '.png', Final)
-
-        # classNUmber=str(int(input_dict["class_sample_list"][0]))
-        # Qname=input_dict['query_name_list'].split('/')[1].replace('.jpg','')
-        # Sname=input_dict['support_names_list'][0].split('/')[1].replace('.jpg','')
-
-        # torch.save(output_list,
-        #            'PredIm/' + Qname + '---' + Sname + '---' + classNUmber + '---' + str(idx) + '---Pred.pt')
-        # torch.save(masks_list,
-        #            'PredIm/' + Qname + '---' + Sname + '---' + classNUmber + '---' + str(idx) + '---Mask.pt')
 
         area_inter, area_union = Evaluator.classify_prediction(output_list, masks_list, None)
         average_meter1.update(area_inter, area_union, input_dict["class_sample_list"], None)
@@ -667,6 +466,7 @@ def validateKFold(val_loader, model_engine, epoch, writer, args):
         print("miou: {:.4f}, fbiou: {:.4f}".format(miouFewshot, fb_iouFewshot))
 
     return miouFewshot, fb_iouFewshot
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
